@@ -1478,7 +1478,10 @@ fn headerEndOffset(raw: []const u8) ?usize {
 }
 
 fn expectedHttpRequestSize(raw: []const u8) !?usize {
-    const header_end = headerEndOffset(raw) orelse return null;
+    const header_end = headerEndOffset(raw) orelse {
+        if (raw.len > MAX_HEADER_SIZE) return error.RequestTooLarge;
+        return null;
+    };
     if (header_end > MAX_HEADER_SIZE) return error.RequestTooLarge;
 
     const header_slice = raw[0..header_end];
@@ -2877,9 +2880,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
 
         // Send HTTP response
-        var resp_buf: [2048]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ response_status, response_body.len, response_body }) catch continue;
-        _ = conn.stream.write(resp) catch continue;
+        writeJsonResponse(&conn.stream, response_status, response_body);
     }
 }
 
@@ -4012,6 +4013,13 @@ test "extractBody returns null for no separator" {
 test "expectedHttpRequestSize returns null when headers are incomplete" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
     try std.testing.expect(try expectedHttpRequestSize(raw) == null);
+}
+
+test "expectedHttpRequestSize rejects oversized incomplete headers" {
+    const raw = try std.testing.allocator.alloc(u8, MAX_HEADER_SIZE + 1);
+    defer std.testing.allocator.free(raw);
+    for (raw) |*byte| byte.* = 'a';
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
 }
 
 test "expectedHttpRequestSize returns header length for requests without body" {
