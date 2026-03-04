@@ -346,6 +346,68 @@ pub const OpenAiCompatibleProvider = struct {
         needs_free: bool,
     };
 
+    const SplitThinkContent = struct {
+        visible: []const u8,
+        reasoning: ?[]const u8,
+    };
+
+    fn scanThinkContent(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        visible_out: *std.ArrayListUnmanaged(u8),
+        reasoning_out: ?*std.ArrayListUnmanaged(u8),
+    ) !void {
+        var i: usize = 0;
+        var depth: usize = 0;
+        while (i < text.len) {
+            if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
+                depth += 1;
+                i += think_open_tag.len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
+                if (depth > 0) depth -= 1;
+                i += think_close_tag.len;
+                continue;
+            }
+
+            if (depth == 0) {
+                try visible_out.append(allocator, text[i]);
+            } else if (reasoning_out) |reasoning_buf| {
+                try reasoning_buf.append(allocator, text[i]);
+            }
+            i += 1;
+        }
+    }
+
+    fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
+        if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+            return .{
+                .visible = try allocator.dupe(u8, text),
+                .reasoning = null,
+            };
+        }
+
+        var visible_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer visible_buf.deinit(allocator);
+        var reasoning_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer reasoning_buf.deinit(allocator);
+
+        try scanThinkContent(allocator, text, &visible_buf, &reasoning_buf);
+
+        const visible_trimmed = std.mem.trim(u8, visible_buf.items, " \t\r\n");
+        const visible = try allocator.dupe(u8, visible_trimmed);
+        errdefer allocator.free(visible);
+
+        const reasoning_trimmed = std.mem.trim(u8, reasoning_buf.items, " \t\r\n");
+        const reasoning = if (reasoning_trimmed.len > 0) try allocator.dupe(u8, reasoning_trimmed) else null;
+
+        return .{
+            .visible = visible,
+            .reasoning = reasoning,
+        };
+    }
+
     const ThinkStripStreamCtx = struct {
         downstream: root.StreamCallback,
         downstream_ctx: *anyopaque,
@@ -454,22 +516,7 @@ pub const OpenAiCompatibleProvider = struct {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
 
-        var i: usize = 0;
-        var depth: usize = 0;
-        while (i < text.len) {
-            if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
-                depth += 1;
-                i += think_open_tag.len;
-                continue;
-            }
-            if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
-                if (depth > 0) depth -= 1;
-                i += think_close_tag.len;
-                continue;
-            }
-            if (depth == 0) try out.append(allocator, text[i]);
-            i += 1;
-        }
+        try scanThinkContent(allocator, text, &out, null);
 
         const cleaned = try out.toOwnedSlice(allocator);
         const trimmed = std.mem.trim(u8, cleaned, " \t\r\n");
@@ -519,9 +566,12 @@ pub const OpenAiCompatibleProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                var reasoning_content: ?[]const u8 = null;
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
-                        content = try stripThinkBlocks(allocator, c.string);
+                        const split = try splitThinkContent(allocator, c.string);
+                        content = split.visible;
+                        reasoning_content = split.reasoning;
                     }
                 }
 
@@ -568,6 +618,7 @@ pub const OpenAiCompatibleProvider = struct {
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
+                    .reasoning_content = reasoning_content,
                 };
             }
         }
@@ -1012,9 +1063,9 @@ test "parseTextResponse strips think blocks" {
     try std.testing.expectEqualStrings("Visible answer", result);
 }
 
-test "parseNativeResponse strips think blocks from content" {
+test "parseNativeResponse splits think blocks into content and reasoning_content" {
     const body =
-        \\{"choices":[{"message":{"content":"<think>private reasoning</think>\nVisible answer"}}],"model":"minimax-m2.5"}
+        \\{"choices":[{"message":{"content":"<think>private chain of thought</think>\nVisible answer"}}],"model":"minimax-m2.5"}
     ;
     const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
     defer {
@@ -1028,9 +1079,14 @@ test "parseNativeResponse strips think blocks from content" {
         }
         if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
         if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |reasoning| {
+            if (reasoning.len > 0) std.testing.allocator.free(reasoning);
+        }
     }
     try std.testing.expect(result.content != null);
     try std.testing.expectEqualStrings("Visible answer", result.content.?);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("private chain of thought", result.reasoning_content.?);
 }
 
 test "streamThinkSanitizeCallback strips think blocks across chunk boundaries" {
