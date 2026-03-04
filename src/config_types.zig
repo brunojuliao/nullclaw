@@ -36,6 +36,10 @@ pub const SandboxBackend = enum {
 
 pub const ProviderEntry = struct {
     name: []const u8,
+    /// Provider credential payload.
+    /// Usually a string API key/token.
+    /// For providers that support structured credentials (e.g. Vertex service-account JSON),
+    /// the parser accepts object/array JSON and stores it as a compact JSON string.
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
@@ -142,6 +146,32 @@ pub const SchedulerConfig = struct {
     agent_timeout_secs: u64 = 0,
 };
 
+// ── Tool filter groups ──────────────────────────────────────────
+
+/// Controls which MCP tools are included in the schema sent to the LLM each turn.
+///
+/// Two modes:
+///   - `always`:  tools matching `tools` patterns are always included (no keywords needed).
+///   - `dynamic`: tools matching `tools` patterns are included only when the user message
+///                contains at least one of the `keywords` (case-insensitive substring match).
+///
+/// Built-in (non-MCP) tools are always included regardless of filter groups.
+/// If no filter groups are configured, all tools pass through unchanged.
+pub const ToolFilterGroupMode = enum {
+    always,
+    dynamic,
+};
+
+pub const ToolFilterGroup = struct {
+    mode: ToolFilterGroupMode,
+    /// Glob patterns matched against tool names (e.g. "mcp_vikunja_*").
+    /// Supports `*` wildcard only (prefix/suffix/infix).
+    tools: []const []const u8 = &.{},
+    /// Keywords for `dynamic` mode — case-insensitive substring match against user message.
+    /// Ignored when mode is `always`.
+    keywords: []const []const u8 = &.{},
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 1000,
@@ -160,6 +190,9 @@ pub const AgentConfig = struct {
     status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
+    /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
+    /// See ToolFilterGroup for semantics.
+    tool_filter_groups: []const ToolFilterGroup = &.{},
 };
 
 pub const ToolsConfig = struct {
