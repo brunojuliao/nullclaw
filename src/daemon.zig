@@ -709,7 +709,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web");
+        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
