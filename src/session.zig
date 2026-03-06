@@ -378,7 +378,7 @@ pub const SessionManager = struct {
                     session_hash,
                     content.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -442,7 +442,7 @@ pub const SessionManager = struct {
                     session_hash,
                     response.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
