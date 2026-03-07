@@ -302,24 +302,6 @@ fn nextPendingMediaDeadline(group_ids: []const ?[]const u8, received_at: []const
     return if (seen) next_deadline else null;
 }
 
-fn pendingTextLatestSeenForKey(
-    id: []const u8,
-    sender: []const u8,
-    pending_messages: []const root.ChannelMessage,
-    received_at: []const u64,
-) ?u64 {
-    const n = @min(pending_messages.len, received_at.len);
-    var seen = false;
-    var latest: u64 = 0;
-    for (0..n) |i| {
-        const msg = pending_messages[i];
-        if (!std.mem.eql(u8, msg.id, id) or !std.mem.eql(u8, msg.sender, sender)) continue;
-        if (!seen or received_at[i] > latest) latest = received_at[i];
-        seen = true;
-    }
-    return if (seen) latest else null;
-}
-
 const PendingTextChainStats = telegram_ingress.PendingTextChainStats;
 
 fn pendingTextChainStatsForKey(
@@ -1670,22 +1652,20 @@ pub const TelegramChannel = struct {
 
     fn cancelPendingTextChainForKey(self: *TelegramChannel, id: []const u8, sender: []const u8) void {
         if (self.pending_text_messages.items.len == 0) return;
-        if (self.pending_text_messages.items.len != self.pending_text_received_at.items.len) {
+        if (!telegram_ingress.pendingTextBuffersInSync(
+            self.pending_text_messages.items,
+            self.pending_text_received_at.items,
+        )) {
             self.resetPendingTextBuffers();
             return;
         }
-
-        var i: usize = 0;
-        while (i < self.pending_text_messages.items.len) {
-            const pending = self.pending_text_messages.items[i];
-            if (std.mem.eql(u8, pending.id, id) and std.mem.eql(u8, pending.sender, sender)) {
-                const removed = self.pending_text_messages.orderedRemove(i);
-                _ = self.pending_text_received_at.orderedRemove(i);
-                removed.deinit(self.allocator);
-                continue;
-            }
-            i += 1;
-        }
+        telegram_ingress.cancelPendingTextChainForKey(
+            self.allocator,
+            &self.pending_text_messages,
+            &self.pending_text_received_at,
+            id,
+            sender,
+        );
     }
 
     fn maybeSweepTempMediaFiles(self: *TelegramChannel) void {
@@ -1833,7 +1813,10 @@ pub const TelegramChannel = struct {
         media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
     ) void {
         if (self.pending_text_messages.items.len == 0) return;
-        if (self.pending_text_messages.items.len != self.pending_text_received_at.items.len) {
+        if (!telegram_ingress.pendingTextBuffersInSync(
+            self.pending_text_messages.items,
+            self.pending_text_received_at.items,
+        )) {
             log.warn("telegram pending text buffers out of sync; resetting buffers", .{});
             self.resetPendingTextBuffers();
             return;
@@ -1843,18 +1826,12 @@ pub const TelegramChannel = struct {
 
         var i: usize = 0;
         while (i < self.pending_text_messages.items.len) {
-            const msg = self.pending_text_messages.items[i];
-            const stats = pendingTextChainStatsForKey(
-                msg.id,
-                msg.sender,
+            if (!telegram_ingress.pendingTextChainMatureAtIndex(
+                now,
                 self.pending_text_messages.items,
                 self.pending_text_received_at.items,
-            ) orelse {
-                i += 1;
-                continue;
-            };
-            const chain_debounce_secs = textDebounceSecsForChain(stats.parts, stats.total_bytes);
-            if (now < stats.latest + chain_debounce_secs) {
+                i,
+            )) {
                 i += 1;
                 continue;
             }

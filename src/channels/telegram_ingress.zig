@@ -68,6 +68,17 @@ fn chainStillWarm(now: u64, stats: PendingTextChainStats) bool {
     return now <= stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
 }
 
+fn chainIsMature(now: u64, stats: PendingTextChainStats) bool {
+    return !chainStillWarm(now, stats);
+}
+
+pub fn pendingTextBuffersInSync(
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+) bool {
+    return pending_messages.len == received_at.len;
+}
+
 pub fn nextPendingTextDeadline(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
@@ -106,6 +117,45 @@ pub fn shouldDebounceTextMessage(
         received_at,
     ) orelse return false;
     return chainStillWarm(now, stats);
+}
+
+pub fn pendingTextChainMatureAtIndex(
+    now: u64,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+    index: usize,
+) bool {
+    if (index >= pending_messages.len or index >= received_at.len) return false;
+
+    const msg = pending_messages[index];
+    const stats = pendingTextChainStatsForKey(
+        msg.id,
+        msg.sender,
+        pending_messages,
+        received_at,
+    ) orelse return false;
+    return chainIsMature(now, stats);
+}
+
+pub fn cancelPendingTextChainForKey(
+    allocator: std.mem.Allocator,
+    pending_messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+    received_at: *std.ArrayListUnmanaged(u64),
+    id: []const u8,
+    sender: []const u8,
+) void {
+    var i: usize = 0;
+    while (i < pending_messages.items.len and i < received_at.items.len) {
+        const pending = pending_messages.items[i];
+        if (!matchesPendingTextKey(pending, id, sender)) {
+            i += 1;
+            continue;
+        }
+
+        const removed = pending_messages.orderedRemove(i);
+        _ = received_at.orderedRemove(i);
+        removed.deinit(allocator);
+    }
 }
 
 fn findNextMergeCandidateIndex(messages: []const root.ChannelMessage, start: usize) ?usize {
