@@ -15,6 +15,7 @@ const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
+const provider_names = @import("provider_names.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
@@ -135,13 +136,7 @@ pub const known_providers = [_]ProviderInfo{
 
 /// Canonicalize provider name (handle aliases).
 pub fn canonicalProviderName(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "grok")) return "xai";
-    if (std.mem.eql(u8, name, "together")) return "together-ai";
-    if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
-    if (std.mem.eql(u8, name, "vertex-ai") or std.mem.eql(u8, name, "google-vertex")) return "vertex";
-    if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
-    if (std.mem.eql(u8, name, "azure-openai") or std.mem.eql(u8, name, "azure_openai")) return "azure";
-    return name;
+    return provider_names.canonicalProviderName(name);
 }
 
 fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {

@@ -11,6 +11,7 @@ const compatible = @import("compatible.zig");
 const claude_cli = @import("claude_cli.zig");
 const codex_cli = @import("codex_cli.zig");
 const openai_codex = @import("openai_codex.zig");
+const provider_names = @import("../provider_names.zig");
 
 pub const ProviderKind = enum {
     anthropic_provider,
@@ -198,11 +199,12 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
 fn normalizeAzureBaseUrlOwned(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
     const raw = trimTrailingSlash(base_url orelse AZURE_DEFAULT_BASE_URL);
 
-    if (std.mem.endsWith(u8, raw, "/chat/completions") or
-        std.mem.endsWith(u8, raw, "/responses") or
-        std.mem.endsWith(u8, raw, "/openai/v1"))
-    {
+    if (std.mem.endsWith(u8, raw, "/chat/completions") or std.mem.endsWith(u8, raw, "/openai/v1")) {
         return allocator.dupe(u8, raw);
+    }
+
+    if (std.mem.endsWith(u8, raw, "/responses")) {
+        return allocator.dupe(u8, raw[0 .. raw.len - "/responses".len]);
     }
 
     if (std.mem.endsWith(u8, raw, "/openai")) {
@@ -234,11 +236,13 @@ const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
 
 /// Determine which provider to create from a name string.
 pub fn classifyProvider(name: []const u8) ProviderKind {
+    const canonical = provider_names.canonicalProviderName(name);
+
     // Check core (non-compatible) providers first.
-    if (core_providers.get(name)) |kind| return kind;
+    if (core_providers.get(canonical)) |kind| return kind;
 
     // Check compatible providers table.
-    if (findCompatProvider(name) != null) return .compatible_provider;
+    if (findCompatProvider(canonical) != null or findCompatProvider(name) != null) return .compatible_provider;
 
     // custom: prefix
     if (std.mem.startsWith(u8, name, "custom:")) return .compatible_provider;
@@ -521,6 +525,14 @@ test "normalizeAzureBaseUrlOwned appends openai v1 path" {
     const v1 = try normalizeAzureBaseUrlOwned(alloc, "https://resource.openai.azure.com/openai/v1/");
     defer alloc.free(v1);
     try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", v1);
+}
+
+test "normalizeAzureBaseUrlOwned strips terminal responses endpoint" {
+    const alloc = std.testing.allocator;
+
+    const responses = try normalizeAzureBaseUrlOwned(alloc, "https://resource.openai.azure.com/openai/v1/responses/");
+    defer alloc.free(responses);
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", responses);
 }
 
 test "compatibleProviderUrl CN/intl variants" {
