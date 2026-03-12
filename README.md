@@ -222,7 +222,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
 | **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
-| **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
+| **Skills** | Loader | TOML/JSON manifests or YAML frontmatter in `SKILL.md` | Community skill packs |
 | **Peripherals** | `Peripheral` | Serial, Arduino, Raspberry Pi GPIO, STM32/Nucleo | Any hardware interface |
 | **Cron** | Scheduler | Cron expressions + one-shot timers with JSON persistence | — |
 
