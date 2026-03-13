@@ -299,6 +299,44 @@ Rules:
 - `allow_from: []` means deny all inbound messages.
 - `allow_from: ["*"]` means allow all sources (use only when you accept the risk).
 
+Max example:
+
+```json
+{
+  "channels": {
+    "max": [
+      {
+        "account_id": "main",
+        "bot_token": "MAX_BOT_TOKEN",
+        "allow_from": ["YOUR_MAX_USER_ID"],
+        "group_allow_from": ["YOUR_MAX_USER_ID"],
+        "group_policy": "allowlist",
+        "mode": "webhook",
+        "webhook_url": "https://bot.example.com/max?account_id=main",
+        "webhook_secret": "replace-with-random-secret",
+        "require_mention": true,
+        "streaming": true,
+        "interactive": {
+          "enabled": true,
+          "ttl_secs": 900,
+          "owner_only": true
+        }
+      }
+    ]
+  }
+}
+```
+
+Max notes:
+
+- `channels.max` is an array of account entries; `account_id` distinguishes multiple Max bots.
+- Prefer `mode = "webhook"` for production. Max documents long polling as suitable for development/testing, while webhooks are the recommended production path.
+- `webhook_url` must be HTTPS.
+- For multi-account webhook setups, give each account either a unique `webhook_secret` or a unique `account_id` query in the webhook URL, for example `/max?account_id=main`.
+- `allow_from` and `group_allow_from` accept either Max `user_id` values or usernames. `user_id` is the stable choice for bindings and routing.
+- `require_mention = true` only affects group chats. Direct messages and `bot_started` deep links still work normally.
+- Max inline buttons are one-shot in nullclaw: after a valid click, the original keyboard is cleared to avoid stale buttons.
+
 ### `memory`
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.

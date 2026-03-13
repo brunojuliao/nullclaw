@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const interaction_choices = @import("../interactions/choices.zig");
 const max_api = @import("max_api.zig");
 const max_ingress = @import("max_ingress.zig");
 const thread_stacks = @import("../thread_stacks.zig");
@@ -145,6 +146,79 @@ fn parseAttachmentMarkers(allocator: std.mem.Allocator, text: []const u8) !Parse
     };
 }
 
+fn validateChoices(choices: []const root.Channel.OutboundChoice) bool {
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) {
+        return false;
+    }
+
+    for (choices) |choice| {
+        if (choice.id.len == 0 or choice.id.len > interaction_choices.MAX_ID_LEN) return false;
+        if (choice.label.len == 0 or choice.label.len > interaction_choices.MAX_LABEL_LEN) return false;
+        if (choice.submit_text.len == 0 or choice.submit_text.len > interaction_choices.MAX_SUBMIT_TEXT_LEN) return false;
+    }
+
+    return true;
+}
+
+fn buildOutgoingTextChunks(allocator: std.mem.Allocator, text: []const u8) ![]OutgoingTextChunk {
+    if (text.len == 0) return allocator.alloc(OutgoingTextChunk, 0);
+
+    var raw_chunks: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer raw_chunks.deinit(allocator);
+
+    var it = root.splitMessage(text, MAX_MESSAGE_LEN - CONTINUATION_MARKER.len);
+    while (it.next()) |chunk| {
+        try raw_chunks.append(allocator, chunk);
+    }
+
+    const chunks = try allocator.alloc(OutgoingTextChunk, raw_chunks.items.len);
+    var built: usize = 0;
+    errdefer {
+        for (chunks[0..built]) |chunk| chunk.deinit(allocator);
+        allocator.free(chunks);
+    }
+
+    for (raw_chunks.items, 0..) |chunk, i| {
+        const is_last = i == raw_chunks.items.len - 1;
+        if (is_last) {
+            chunks[i] = .{ .body = chunk };
+        } else {
+            var body: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer body.deinit(allocator);
+            try body.appendSlice(allocator, chunk);
+            try body.appendSlice(allocator, CONTINUATION_MARKER);
+            const owned = try body.toOwnedSlice(allocator);
+            chunks[i] = .{
+                .body = owned,
+                .owned = owned,
+            };
+        }
+        built += 1;
+    }
+
+    return chunks;
+}
+
+fn buildDraftPreviewChunk(allocator: std.mem.Allocator, text: []const u8) !OutgoingTextChunk {
+    if (text.len == 0) return .{ .body = "" };
+
+    var it = root.splitMessage(text, MAX_MESSAGE_LEN - CONTINUATION_MARKER.len);
+    const first_chunk = it.next() orelse return .{ .body = "" };
+    if (it.remaining.len == 0) {
+        return .{ .body = first_chunk };
+    }
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try body.appendSlice(allocator, first_chunk);
+    try body.appendSlice(allocator, CONTINUATION_MARKER);
+    const owned = try body.toOwnedSlice(allocator);
+    return .{
+        .body = owned,
+        .owned = owned,
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Draft State (streaming via message editing)
 // ════════════════════════════════════════════════════════════════════════════
@@ -158,6 +232,15 @@ const DraftState = struct {
     fn deinit(self: *DraftState, allocator: std.mem.Allocator) void {
         if (self.mid) |m| allocator.free(m);
         self.buffer.deinit(allocator);
+    }
+};
+
+const OutgoingTextChunk = struct {
+    body: []const u8,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: *const OutgoingTextChunk, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
     }
 };
 
@@ -185,12 +268,14 @@ const PendingInteraction = struct {
     chat_id: []const u8,
     owner_identity: ?[]const u8 = null,
     owner_only: bool = true,
+    message_text: ?[]const u8 = null,
     options: []PendingInteractionOption,
 
     fn deinit(self: *const PendingInteraction) void {
         self.allocator.free(self.account_id);
         self.allocator.free(self.chat_id);
         if (self.owner_identity) |owner| self.allocator.free(owner);
+        if (self.message_text) |text| self.allocator.free(text);
         for (self.options) |opt| opt.deinit(self.allocator);
         self.allocator.free(self.options);
     }
@@ -200,6 +285,7 @@ const CallbackSelection = union(enum) {
     ok: struct {
         submit_text: []u8,
         callback_notification: []u8,
+        clear_message_text: ?[]u8 = null,
     },
     not_found,
     expired,
@@ -354,7 +440,7 @@ pub const MaxChannel = struct {
     // ── Fetch bot identity ───────────────────────────────────────────
 
     fn fetchBotIdentity(self: *MaxChannel) void {
-        if (self.bot_username != null) return;
+        if (self.bot_username != null and self.bot_user_id != null) return;
         if (comptime builtin.is_test) return;
         const info = self.api().fetchBotInfo(self.allocator) orelse return;
         defer info.deinit(self.allocator);
@@ -393,6 +479,10 @@ pub const MaxChannel = struct {
         return false;
     }
 
+    fn stableSenderId(_: *const MaxChannel, sender: *const max_ingress.SenderInfo) []const u8 {
+        return sender.user_id;
+    }
+
     // ── Send (text + attachments) ────────────────────────────────────
 
     pub fn sendMessage(self: *MaxChannel, target: []const u8, text: []const u8) !void {
@@ -411,28 +501,18 @@ pub const MaxChannel = struct {
     fn sendTextChunked(self: *MaxChannel, target: []const u8, text: []const u8) !void {
         if (text.len == 0) return;
 
-        var it = root.splitMessage(text, MAX_MESSAGE_LEN - CONTINUATION_MARKER.len);
-        var chunk_index: usize = 0;
-        while (it.next()) |chunk| {
-            const has_more = it.remaining.len > 0;
-            const body = if (has_more) blk: {
-                var buf: std.ArrayListUnmanaged(u8) = .empty;
-                defer buf.deinit(self.allocator);
-                try buf.appendSlice(self.allocator, chunk);
-                try buf.appendSlice(self.allocator, CONTINUATION_MARKER);
-                const owned = try allocatorDupeSlice(self.allocator, buf.items);
-                const body_json = try max_api.buildTextMessageBody(self.allocator, owned, "markdown");
-                self.allocator.free(owned);
-                break :blk body_json;
-            } else blk: {
-                break :blk try max_api.buildTextMessageBody(self.allocator, chunk, "markdown");
-            };
+        const chunks = try buildOutgoingTextChunks(self.allocator, text);
+        defer {
+            for (chunks) |chunk| chunk.deinit(self.allocator);
+            self.allocator.free(chunks);
+        }
+
+        for (chunks) |chunk| {
+            const body = try max_api.buildTextMessageBody(self.allocator, chunk.body, "markdown");
             defer self.allocator.free(body);
 
             const resp = try self.api().sendMessage(self.allocator, target, body);
             self.allocator.free(resp);
-
-            chunk_index += 1;
         }
     }
 
@@ -454,14 +534,24 @@ pub const MaxChannel = struct {
         try root.json_util.appendJsonString(&body, self.allocator, token);
         try body.appendSlice(self.allocator, "}}]}");
 
-        const resp = try self.api().sendMessage(self.allocator, target, body.items);
-        self.allocator.free(resp);
+        var attempt: u8 = 0;
+        while (true) {
+            const resp = try self.api().sendMessage(self.allocator, target, body.items);
+            const ready = std.mem.indexOf(u8, resp, "attachment.not.ready") == null;
+            self.allocator.free(resp);
+
+            if (ready) break;
+            if (attempt >= 4) return error.AttachmentNotReady;
+
+            attempt += 1;
+            if (!builtin.is_test) std.Thread.sleep(500 * std.time.ns_per_ms);
+        }
     }
 
     // ── sendRich (inline keyboards) ──────────────────────────────────
 
     pub fn sendRichPayload(self: *MaxChannel, target: []const u8, payload: root.Channel.OutboundPayload) !void {
-        if (payload.choices.len > 0 and self.interactive.enabled) {
+        if (payload.choices.len > 0 and self.interactive.enabled and validateChoices(payload.choices)) {
             const token = try self.nextInteractionToken();
             defer self.allocator.free(token);
 
@@ -507,6 +597,7 @@ pub const MaxChannel = struct {
                 target,
                 tls_interaction_owner_identity,
                 payload.choices,
+                payload.text,
             ) catch |err| log.warn("max registerPendingInteraction failed: {}", .{err});
 
             for (payload.attachments) |att| {
@@ -562,6 +653,7 @@ pub const MaxChannel = struct {
         chat_id: []const u8,
         owner_identity: ?[]const u8,
         choices: []const root.Channel.OutboundChoice,
+        message_text: []const u8,
     ) !void {
         const now = root.nowEpochSecs();
         const ttl = self.interactive.ttl_secs;
@@ -597,6 +689,12 @@ pub const MaxChannel = struct {
             null;
         errdefer if (owner_dup) |owner| self.allocator.free(owner);
 
+        const message_text_dup = if (message_text.len > 0)
+            try self.allocator.dupe(u8, message_text)
+        else
+            null;
+        errdefer if (message_text_dup) |text| self.allocator.free(text);
+
         shared_interactions_mu.lock();
         defer shared_interactions_mu.unlock();
 
@@ -610,6 +708,7 @@ pub const MaxChannel = struct {
             .chat_id = chat_id_dup,
             .owner_identity = owner_dup,
             .owner_only = self.interactive.owner_only,
+            .message_text = message_text_dup,
             .options = options,
         });
     }
@@ -665,6 +764,12 @@ pub const MaxChannel = struct {
         errdefer self.allocator.free(submit_text);
 
         const callback_notification = self.allocator.dupe(u8, interaction.options[option_index].label) catch return .invalid_option;
+        errdefer self.allocator.free(callback_notification);
+        const clear_message_text = if (interaction.message_text) |text|
+            self.allocator.dupe(u8, text) catch return .invalid_option
+        else
+            null;
+        errdefer if (clear_message_text) |text| self.allocator.free(text);
 
         if (shared_interactions.fetchRemove(token)) |removed| {
             removed.value.deinit();
@@ -674,6 +779,7 @@ pub const MaxChannel = struct {
         return .{ .ok = .{
             .submit_text = submit_text,
             .callback_notification = callback_notification,
+            .clear_message_text = clear_message_text,
         } };
     }
 
@@ -759,12 +865,16 @@ pub const MaxChannel = struct {
             return;
         }
 
+        const preview = buildDraftPreviewChunk(self.allocator, state.buffer.items) catch return;
+        defer preview.deinit(self.allocator);
+        if (preview.body.len == 0) return;
+
         // Flush: send or edit
         if (state.mid == null) {
             // Send initial message
             const body = max_api.buildTextMessageBody(
                 self.allocator,
-                state.buffer.items,
+                preview.body,
                 "markdown",
             ) catch return;
             defer self.allocator.free(body);
@@ -783,7 +893,7 @@ pub const MaxChannel = struct {
             // Edit existing message
             const body = max_api.buildTextMessageBody(
                 self.allocator,
-                state.buffer.items,
+                preview.body,
                 "markdown",
             ) catch return;
             defer self.allocator.free(body);
@@ -813,13 +923,26 @@ pub const MaxChannel = struct {
         if (draft_mid) |mid| {
             const parsed = try parseAttachmentMarkers(self.allocator, message);
             defer parsed.deinit(self.allocator);
+            const chunks = try buildOutgoingTextChunks(self.allocator, parsed.remaining_text);
+            defer {
+                for (chunks) |chunk| chunk.deinit(self.allocator);
+                self.allocator.free(chunks);
+            }
 
-            if (parsed.remaining_text.len > 0) {
-                const body = try max_api.buildTextMessageBody(self.allocator, parsed.remaining_text, "markdown");
+            if (chunks.len > 0) {
+                const body = try max_api.buildTextMessageBody(self.allocator, chunks[0].body, "markdown");
                 defer self.allocator.free(body);
 
                 const resp = try self.api().editMessage(self.allocator, mid, body);
                 self.allocator.free(resp);
+
+                for (chunks[1..]) |chunk| {
+                    const chunk_body = try max_api.buildTextMessageBody(self.allocator, chunk.body, "markdown");
+                    defer self.allocator.free(chunk_body);
+
+                    const chunk_resp = try self.api().sendMessage(self.allocator, target, chunk_body);
+                    self.allocator.free(chunk_resp);
+                }
             } else {
                 self.api().deleteMessage(self.allocator, mid) catch {};
             }
@@ -842,14 +965,21 @@ pub const MaxChannel = struct {
         try self.stopTyping(chat_id);
 
         const key_copy = try self.allocator.dupe(u8, chat_id);
-        errdefer self.allocator.free(key_copy);
-
         const task = try self.allocator.create(TypingTask);
-        errdefer self.allocator.destroy(task);
         task.* = .{
             .max_channel = self,
             .chat_id = key_copy,
         };
+
+        var spawned = false;
+        errdefer {
+            if (spawned) {
+                task.stop_requested.store(true, .release);
+                if (task.thread) |t| t.join();
+            }
+            self.allocator.destroy(task);
+            self.allocator.free(key_copy);
+        }
 
         if (comptime !builtin.is_test) {
             task.thread = try std.Thread.spawn(
@@ -857,6 +987,7 @@ pub const MaxChannel = struct {
                 typingLoop,
                 .{task},
             );
+            spawned = true;
         }
 
         self.typing_mu.lock();
@@ -944,7 +1075,7 @@ pub const MaxChannel = struct {
 
                 const id_owned = allocator.dupe(u8, msg.mid orelse "unknown") catch return null;
                 errdefer allocator.free(id_owned);
-                const sender_owned = allocator.dupe(u8, msg.sender.identity()) catch {
+                const sender_owned = allocator.dupe(u8, self.stableSenderId(&msg.sender)) catch {
                     allocator.free(id_owned);
                     return null;
                 };
@@ -991,12 +1122,18 @@ pub const MaxChannel = struct {
                         switch (self.consumeInteractionSelection(
                             parsed_payload.token,
                             parsed_payload.option_index,
-                            cb.sender.identity(),
+                            self.stableSenderId(&cb.sender),
                             cb.chat_id,
                         )) {
                             .ok => |selection| {
-                                self.api().answerCallback(allocator, cb.callback_id, selection.callback_notification) catch {};
+                                const clear_message_body = if (selection.clear_message_text) |text|
+                                    max_api.buildTextMessageBodyClearingAttachments(allocator, text, "markdown") catch null
+                                else
+                                    null;
+                                defer if (clear_message_body) |body| allocator.free(body);
+                                self.api().answerCallbackWithMessage(allocator, cb.callback_id, selection.callback_notification, clear_message_body) catch {};
                                 allocator.free(selection.callback_notification);
+                                if (selection.clear_message_text) |text| allocator.free(text);
                                 break :blk selection.submit_text;
                             },
                             .owner_mismatch => {
@@ -1023,7 +1160,7 @@ pub const MaxChannel = struct {
                     return null;
                 };
                 errdefer allocator.free(id_owned);
-                const sender_owned = allocator.dupe(u8, cb.sender.identity()) catch {
+                const sender_owned = allocator.dupe(u8, self.stableSenderId(&cb.sender)) catch {
                     allocator.free(id_owned);
                     allocator.free(content_text);
                     return null;
@@ -1041,7 +1178,7 @@ pub const MaxChannel = struct {
                     .sender = sender_owned,
                     .content = content_text,
                     .channel = "max",
-                    .timestamp = root.nowEpochSecs(),
+                    .timestamp = if (cb.timestamp > 0) cb.timestamp else root.nowEpochSecs(),
                     .reply_target = reply_target,
                     .is_group = cb.is_group,
                 };
@@ -1063,9 +1200,12 @@ pub const MaxChannel = struct {
                     start_content.appendSlice(allocator, payload) catch return null;
                 }
 
-                const id_owned = allocator.dupe(u8, "bot_started") catch return null;
+                const id_owned = if (bs.timestamp > 0)
+                    std.fmt.allocPrint(allocator, "bot_started:{s}:{d}", .{ bs.chat_id, bs.timestamp }) catch return null
+                else
+                    std.fmt.allocPrint(allocator, "bot_started:{s}", .{bs.chat_id}) catch return null;
                 errdefer allocator.free(id_owned);
-                const sender_owned = allocator.dupe(u8, bs.sender.identity()) catch {
+                const sender_owned = allocator.dupe(u8, self.stableSenderId(&bs.sender)) catch {
                     allocator.free(id_owned);
                     return null;
                 };
@@ -1094,7 +1234,7 @@ pub const MaxChannel = struct {
                     .sender = sender_owned,
                     .content = content_owned,
                     .channel = "max",
-                    .timestamp = root.nowEpochSecs(),
+                    .timestamp = if (bs.timestamp > 0) bs.timestamp else root.nowEpochSecs(),
                     .reply_target = reply_target,
                     .first_name = first_name,
                 };
@@ -1113,11 +1253,8 @@ pub const MaxChannel = struct {
         );
         defer allocator.free(resp);
 
-        // Update marker
-        if (max_ingress.parseUpdatesMarker(allocator, resp)) |new_marker| {
-            if (self.marker) |old| self.allocator.free(old);
-            self.marker = new_marker;
-        }
+        var next_marker = max_ingress.parseUpdatesMarker(allocator, resp);
+        errdefer if (next_marker) |marker| allocator.free(marker);
 
         // Parse updates array
         var parsed_resp = max_ingress.parseUpdatesArray(resp, allocator) orelse return &.{};
@@ -1137,6 +1274,12 @@ pub const MaxChannel = struct {
             if (self.processUpdate(allocator, update_obj)) |msg| {
                 try messages.append(allocator, msg);
             }
+        }
+
+        if (next_marker) |new_marker| {
+            if (self.marker) |old| self.allocator.free(old);
+            self.marker = new_marker;
+            next_marker = null;
         }
 
         return try messages.toOwnedSlice(allocator);
@@ -1299,10 +1442,6 @@ pub const MaxChannel = struct {
     pub fn setBus(_: *MaxChannel, _: anytype) void {}
 };
 
-fn allocatorDupeSlice(allocator: std.mem.Allocator, slice: []const u8) ![]u8 {
-    return allocator.dupe(u8, slice);
-}
-
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or haystack.len < needle.len) return false;
 
@@ -1453,7 +1592,7 @@ test "processUpdate matches allowlist by numeric user_id when username is presen
 
     const msg = ch.processUpdate(allocator, parsed.value) orelse return error.TestUnexpectedResult;
     defer msg.deinit(allocator);
-    try std.testing.expectEqualStrings("alice", msg.sender);
+    try std.testing.expectEqualStrings("42", msg.sender);
 }
 
 test "processUpdate require_mention drops unmentioned group message" {
@@ -1527,7 +1666,7 @@ test "processUpdate message_created produces ChannelMessage" {
     defer msg.deinit(allocator);
 
     try std.testing.expectEqualStrings("msg-1", msg.id);
-    try std.testing.expectEqualStrings("alice", msg.sender);
+    try std.testing.expectEqualStrings("42", msg.sender);
     try std.testing.expectEqualStrings("Hello", msg.content);
     try std.testing.expectEqualStrings("max", msg.channel);
     try std.testing.expectEqualStrings("100", msg.reply_target.?);
@@ -1609,7 +1748,7 @@ test "processUpdate callback consumes registered interaction token once" {
     const choices = [_]root.Channel.OutboundChoice{
         .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
     };
-    try ch.registerPendingInteraction("tok1", "100", "alice", &choices);
+    try ch.registerPendingInteraction("tok1", "100", "42", &choices, "Choose");
 
     const json =
         \\{"update_type":"message_callback","callback_id":"cb-2",
@@ -1635,7 +1774,7 @@ test "processUpdate callback enforces owner_only" {
     const choices = [_]root.Channel.OutboundChoice{
         .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
     };
-    try ch.registerPendingInteraction("tok2", "100", "alice", &choices);
+    try ch.registerPendingInteraction("tok2", "100", "42", &choices, "Choose");
 
     const json =
         \\{"update_type":"message_callback","callback_id":"cb-3",
@@ -1756,6 +1895,29 @@ test "text splitting at MAX_MESSAGE_LEN boundary" {
     const chunk1 = it.next().?;
     try std.testing.expect(chunk1.len <= effective_max);
     try std.testing.expect(it.next() != null);
+}
+
+test "buildOutgoingTextChunks keeps chunks within Max limit" {
+    const allocator = std.testing.allocator;
+    const chunks = try buildOutgoingTextChunks(allocator, "a" ** 5000);
+    defer {
+        for (chunks) |chunk| chunk.deinit(allocator);
+        allocator.free(chunks);
+    }
+
+    try std.testing.expect(chunks.len >= 2);
+    for (chunks) |chunk| {
+        try std.testing.expect(chunk.body.len <= MAX_MESSAGE_LEN);
+    }
+}
+
+test "buildDraftPreviewChunk caps preview length with continuation marker" {
+    const allocator = std.testing.allocator;
+    const preview = try buildDraftPreviewChunk(allocator, "a" ** 5000);
+    defer preview.deinit(allocator);
+
+    try std.testing.expect(preview.body.len <= MAX_MESSAGE_LEN);
+    try std.testing.expect(std.mem.endsWith(u8, preview.body, CONTINUATION_MARKER));
 }
 
 test "CONTINUATION_MARKER is correct" {

@@ -91,7 +91,7 @@ pub const Client = struct {
 
     fn authHeader(self: Client, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token});
+        try fbs.writer().print("Authorization: {s}", .{self.bot_token});
         return fbs.getWritten();
     }
 
@@ -233,6 +233,16 @@ pub const Client = struct {
     // ── Callbacks ───────────────────────────────────────────────────────
 
     pub fn answerCallback(self: Client, allocator: std.mem.Allocator, callback_id: []const u8, notification: ?[]const u8) !void {
+        return self.answerCallbackWithMessage(allocator, callback_id, notification, null);
+    }
+
+    pub fn answerCallbackWithMessage(
+        self: Client,
+        allocator: std.mem.Allocator,
+        callback_id: []const u8,
+        notification: ?[]const u8,
+        message_body_json: ?[]const u8,
+    ) !void {
         if (comptime builtin.is_test) return;
         var url_buf: [512]u8 = undefined;
         const encoded_callback_id = try url_percent.encode(allocator, callback_id);
@@ -245,9 +255,16 @@ pub const Client = struct {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
         try body.appendSlice(allocator, "{");
+        var needs_comma = false;
         if (notification) |text| {
             try body.appendSlice(allocator, "\"notification\":");
             try root.json_util.appendJsonString(&body, allocator, text);
+            needs_comma = true;
+        }
+        if (message_body_json) |message_body| {
+            if (needs_comma) try body.appendSlice(allocator, ",");
+            try body.appendSlice(allocator, "\"message\":");
+            try body.appendSlice(allocator, message_body);
         }
         try body.appendSlice(allocator, "}");
 
@@ -560,6 +577,25 @@ pub fn buildTextMessageBody(allocator: std.mem.Allocator, text: []const u8, form
     return allocator.dupe(u8, buf.items);
 }
 
+pub fn buildTextMessageBodyClearingAttachments(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    format: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"text\":");
+    try root.appendJsonStringW(buf.writer(allocator), text);
+    if (format) |fmt| {
+        try buf.appendSlice(allocator, ",\"format\":");
+        try root.appendJsonStringW(buf.writer(allocator), fmt);
+    }
+    try buf.appendSlice(allocator, ",\"attachments\":[]}");
+
+    return allocator.dupe(u8, buf.items);
+}
+
 /// Build a JSON body for a text message with an inline keyboard.
 ///   { "text": "...", "format": "...", "attachments": [{ "type": "inline_keyboard", "payload": { "buttons": [...] } }] }
 pub fn buildTextWithKeyboardBody(allocator: std.mem.Allocator, text: []const u8, keyboard_json: []const u8, format: ?[]const u8) ![]u8 {
@@ -638,7 +674,7 @@ test "buildUrl with compound query" {
     try std.testing.expectEqualStrings("https://platform-api.max.ru/updates?timeout=30&types=message_created&marker=abc", url);
 }
 
-test "authHeader adds Bearer prefix" {
+test "authHeader uses raw token format required by Max" {
     const client = Client{
         .allocator = std.testing.allocator,
         .bot_token = "token-123",
@@ -646,7 +682,7 @@ test "authHeader adds Bearer prefix" {
     };
     var buf: [128]u8 = undefined;
     const header = try client.authHeader(&buf);
-    try std.testing.expectEqualStrings("Authorization: Bearer token-123", header);
+    try std.testing.expectEqualStrings("Authorization: token-123", header);
 }
 
 test "parseBotInfo with integer user_id" {
@@ -754,6 +790,13 @@ test "buildTextMessageBody escapes special chars" {
     const body = try buildTextMessageBody(allocator, "line1\nline2", null);
     defer allocator.free(body);
     try std.testing.expectEqualStrings("{\"text\":\"line1\\nline2\"}", body);
+}
+
+test "buildTextMessageBodyClearingAttachments removes attachments" {
+    const allocator = std.testing.allocator;
+    const body = try buildTextMessageBodyClearingAttachments(allocator, "Pick one", "markdown");
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("{\"text\":\"Pick one\",\"format\":\"markdown\",\"attachments\":[]}", body);
 }
 
 test "buildInlineKeyboardJson with multiple choices" {

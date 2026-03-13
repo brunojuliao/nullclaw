@@ -108,6 +108,7 @@ pub const InboundCallback = struct {
     sender: SenderInfo,
     chat_id: []u8,
     is_group: bool = false,
+    timestamp: u64 = 0,
 
     pub fn deinit(self: *const InboundCallback, allocator: std.mem.Allocator) void {
         allocator.free(self.callback_id);
@@ -121,6 +122,7 @@ pub const BotStartedInfo = struct {
     sender: SenderInfo,
     chat_id: []u8,
     payload: ?[]u8 = null,
+    timestamp: u64 = 0,
 
     pub fn deinit(self: *const BotStartedInfo, allocator: std.mem.Allocator) void {
         self.sender.deinit(allocator);
@@ -169,7 +171,6 @@ pub fn parseUpdate(allocator: std.mem.Allocator, update_obj: std.json.Value) ?Pa
 // ════════════════════════════════════════════════════════════════════════════
 
 fn parseMessageCreated(allocator: std.mem.Allocator, update_obj: std.json.Value) ?ParsedUpdate {
-    const message_obj = getObject(update_obj, "message") orelse return null;
     const message_val = update_obj.object.get("message") orelse return null;
 
     var sender = parseSender(allocator, message_val) orelse return null;
@@ -248,11 +249,7 @@ fn parseMessageCreated(allocator: std.mem.Allocator, update_obj: std.json.Value)
     // Extract timestamp from the update level
     var timestamp: u64 = 0;
     if (update_obj.object.get("timestamp")) |ts_val| {
-        switch (ts_val) {
-            .integer => |i| timestamp = @intCast(@max(0, i)),
-            .float => |f| timestamp = @intFromFloat(@max(0.0, f)),
-            else => {},
-        }
+        timestamp = normalizeUnixTimestamp(ts_val);
     }
 
     const owned_urls = att_urls.toOwnedSlice(allocator) catch {
@@ -281,8 +278,6 @@ fn parseMessageCreated(allocator: std.mem.Allocator, update_obj: std.json.Value)
         return null;
     };
 
-    _ = message_obj;
-
     return .{ .message = .{
         .sender = sender,
         .chat = chat,
@@ -295,20 +290,15 @@ fn parseMessageCreated(allocator: std.mem.Allocator, update_obj: std.json.Value)
 }
 
 fn parseMessageCallback(allocator: std.mem.Allocator, update_obj: std.json.Value) ?ParsedUpdate {
-    // callback_id is at update level
-    const callback_id_str = getStr(update_obj, "callback_id") orelse return null;
-    const callback_id = allocator.dupe(u8, callback_id_str) catch return null;
-    errdefer allocator.free(callback_id);
-
     // callback object
-    const callback_val = update_obj.object.get("callback") orelse {
-        allocator.free(callback_id);
-        return null;
-    };
-    if (callback_val != .object) {
-        allocator.free(callback_id);
-        return null;
-    }
+    const callback_val = update_obj.object.get("callback") orelse return null;
+    if (callback_val != .object) return null;
+
+    const callback_id = dupStringLikeValue(
+        allocator,
+        callback_val.object.get("callback_id") orelse update_obj.object.get("callback_id") orelse return null,
+    ) orelse return null;
+    errdefer allocator.free(callback_id);
 
     // payload from callback
     const payload_str = getStr(callback_val, "payload") orelse "";
@@ -340,18 +330,11 @@ fn parseMessageCallback(allocator: std.mem.Allocator, update_obj: std.json.Value
         return null;
     }
 
-    const chat_id_str = blk: {
+    const chat_id = blk: {
         const recipient = callback_message.object.get("recipient") orelse break :blk null;
         if (recipient != .object) break :blk null;
-        break :blk getStr(recipient, "chat_id");
+        break :blk dupStringLikeField(allocator, recipient, "chat_id");
     } orelse {
-        allocator.free(callback_id);
-        allocator.free(payload);
-        sender.deinit(allocator);
-        return null;
-    };
-
-    const chat_id = allocator.dupe(u8, chat_id_str) catch {
         allocator.free(callback_id);
         allocator.free(payload);
         sender.deinit(allocator);
@@ -365,12 +348,18 @@ fn parseMessageCallback(allocator: std.mem.Allocator, update_obj: std.json.Value
         break :blk std.mem.eql(u8, chat_type, "chat") or std.mem.eql(u8, chat_type, "channel");
     };
 
+    const timestamp = if (update_obj.object.get("timestamp")) |ts_val|
+        normalizeUnixTimestamp(ts_val)
+    else
+        0;
+
     return .{ .callback = .{
         .callback_id = callback_id,
         .payload = payload,
         .sender = sender,
         .chat_id = chat_id,
         .is_group = is_group,
+        .timestamp = timestamp,
     } };
 }
 
@@ -380,11 +369,7 @@ fn parseBotStarted(allocator: std.mem.Allocator, update_obj: std.json.Value) ?Pa
     errdefer sender.deinit(allocator);
 
     // chat_id at update level
-    const chat_id_str = getStr(update_obj, "chat_id") orelse {
-        sender.deinit(allocator);
-        return null;
-    };
-    const chat_id = allocator.dupe(u8, chat_id_str) catch {
+    const chat_id = dupStringLikeField(allocator, update_obj, "chat_id") orelse {
         sender.deinit(allocator);
         return null;
     };
@@ -400,6 +385,10 @@ fn parseBotStarted(allocator: std.mem.Allocator, update_obj: std.json.Value) ?Pa
         .sender = sender,
         .chat_id = chat_id,
         .payload = payload_val,
+        .timestamp = if (update_obj.object.get("timestamp")) |ts_val|
+            normalizeUnixTimestamp(ts_val)
+        else
+            0,
     } };
 }
 
@@ -411,6 +400,21 @@ fn getStr(obj: std.json.Value, key: []const u8) ?[]const u8 {
     if (obj != .object) return null;
     const val = obj.object.get(key) orelse return null;
     return if (val == .string) val.string else null;
+}
+
+fn dupStringLikeField(allocator: std.mem.Allocator, obj: std.json.Value, key: []const u8) ?[]u8 {
+    if (obj != .object) return null;
+    const val = obj.object.get(key) orelse return null;
+    return dupStringLikeValue(allocator, val);
+}
+
+fn dupStringLikeValue(allocator: std.mem.Allocator, val: std.json.Value) ?[]u8 {
+    return switch (val) {
+        .string => |s| allocator.dupe(u8, s) catch null,
+        .number_string => |s| allocator.dupe(u8, s) catch null,
+        .integer => |i| std.fmt.allocPrint(allocator, "{d}", .{i}) catch null,
+        else => null,
+    };
 }
 
 fn getObject(obj: std.json.Value, key: []const u8) ?std.json.ObjectMap {
@@ -455,7 +459,9 @@ fn parseSenderFields(allocator: std.mem.Allocator, user_obj: std.json.Value) ?Se
     errdefer allocator.free(user_id);
 
     var name_val: ?[]u8 = null;
-    if (getStr(user_obj, "name")) |n| {
+    if (getStr(user_obj, "first_name")) |n| {
+        name_val = allocator.dupe(u8, n) catch null;
+    } else if (getStr(user_obj, "name")) |n| {
         name_val = allocator.dupe(u8, n) catch null;
     }
     errdefer if (name_val) |v| allocator.free(v);
@@ -478,8 +484,7 @@ fn parseChat(allocator: std.mem.Allocator, message_val: std.json.Value) ?ChatInf
     const recipient_val = message_val.object.get("recipient") orelse return null;
     if (recipient_val != .object) return null;
 
-    const chat_id_str = getStr(recipient_val, "chat_id") orelse return null;
-    const chat_id = allocator.dupe(u8, chat_id_str) catch return null;
+    const chat_id = dupStringLikeField(allocator, recipient_val, "chat_id") orelse return null;
 
     const chat_type: ChatType = blk: {
         const ct_str = getStr(recipient_val, "chat_type") orelse break :blk .dialog;
@@ -515,8 +520,24 @@ pub fn parseUpdatesMarker(allocator: std.mem.Allocator, json_resp: []const u8) ?
 
     if (parsed.value != .object) return null;
     const marker_val = parsed.value.object.get("marker") orelse return null;
-    if (marker_val != .string) return null;
-    return allocator.dupe(u8, marker_val.string) catch null;
+    return switch (marker_val) {
+        .string => |s| allocator.dupe(u8, s) catch null,
+        .number_string => |s| allocator.dupe(u8, s) catch null,
+        .integer => |i| std.fmt.allocPrint(allocator, "{d}", .{i}) catch null,
+        else => null,
+    };
+}
+
+fn normalizeUnixTimestamp(value: std.json.Value) u64 {
+    const raw: u64 = switch (value) {
+        .integer => |i| @intCast(@max(0, i)),
+        .float => |f| @intFromFloat(@max(0.0, f)),
+        .number_string => |s| std.fmt.parseInt(u64, s, 10) catch 0,
+        .string => |s| std.fmt.parseInt(u64, s, 10) catch 0,
+        else => 0,
+    };
+
+    return if (raw >= 1_000_000_000_000) raw / 1000 else raw;
 }
 
 /// Parse the full getUpdates response JSON for iteration over the `updates` array.
@@ -554,9 +575,9 @@ test "UpdateType.fromString unknown type" {
 test "parseUpdate message_created text only" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"update_type":"message_created","timestamp":1710000000,
-        \\"message":{"sender":{"user_id":"42","name":"Alice","username":"alice"},
-        \\"recipient":{"chat_id":"100","chat_type":"dialog"},
+        \\{"update_type":"message_created","timestamp":1710000000123,
+        \\"message":{"sender":{"user_id":"42","first_name":"Alice","username":"alice"},
+        \\"recipient":{"chat_id":100,"chat_type":"dialog"},
         \\"body":{"mid":"msg-1","text":"Hello"}}}
     ;
     const parsed = try parseTestJson(allocator, json);
@@ -626,9 +647,9 @@ test "parseUpdate message_created with image attachment" {
 test "parseUpdate message_callback" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"update_type":"message_callback","callback_id":"cb-1",
-        \\"callback":{"payload":"opt1","user":{"user_id":"42","name":"Alice"},
-        \\"message":{"recipient":{"chat_id":"100"}}}}
+        \\{"update_type":"message_callback","timestamp":1710000000456,
+        \\"callback":{"callback_id":"cb-1","payload":"opt1","user":{"user_id":"42","first_name":"Alice"},
+        \\"message":{"recipient":{"chat_id":100}}}}
     ;
     const parsed = try parseTestJson(allocator, json);
     defer parsed.deinit();
@@ -644,6 +665,7 @@ test "parseUpdate message_callback" {
     try std.testing.expectEqualStrings("Alice", cb.sender.name.?);
     try std.testing.expectEqualStrings("100", cb.chat_id);
     try std.testing.expect(!cb.is_group);
+    try std.testing.expectEqual(@as(u64, 1710000000), cb.timestamp);
 }
 
 test "parseUpdate message_callback preserves group recipient type" {
@@ -666,8 +688,8 @@ test "parseUpdate message_callback preserves group recipient type" {
 test "parseUpdate bot_started with payload" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"update_type":"bot_started","chat_id":"100",
-        \\"user":{"user_id":"42","name":"Alice"},"payload":"deep-link-data"}
+        \\{"update_type":"bot_started","timestamp":1710000000789,"chat_id":100,
+        \\"user":{"user_id":"42","first_name":"Alice"},"payload":"deep-link-data"}
     ;
     const parsed = try parseTestJson(allocator, json);
     defer parsed.deinit();
@@ -681,6 +703,7 @@ test "parseUpdate bot_started with payload" {
     try std.testing.expectEqualStrings("Alice", bs.sender.name.?);
     try std.testing.expectEqualStrings("100", bs.chat_id);
     try std.testing.expectEqualStrings("deep-link-data", bs.payload.?);
+    try std.testing.expectEqual(@as(u64, 1710000000), bs.timestamp);
 }
 
 test "parseUpdate bot_started without payload" {
@@ -809,6 +832,13 @@ test "parseUpdatesMarker extracts marker" {
     const marker = parseUpdatesMarker(allocator, json) orelse return error.TestUnexpectedResult;
     defer allocator.free(marker);
     try std.testing.expectEqualStrings("abc-123", marker);
+}
+
+test "parseUpdatesMarker accepts integer marker" {
+    const allocator = std.testing.allocator;
+    const marker = parseUpdatesMarker(allocator, "{\"updates\":[],\"marker\":123456}") orelse return error.TestUnexpectedResult;
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("123456", marker);
 }
 
 test "parseUpdatesMarker returns null on missing marker" {
