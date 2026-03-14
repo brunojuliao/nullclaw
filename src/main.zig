@@ -315,6 +315,36 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
     cfg.gateway.host = host;
 }
 
+fn isTruthyFlag(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
+fn isYoloForceEnabled() bool {
+    if (std.posix.getenv("NULLCLAW_ALLOW_YOLO")) |v| {
+        if (isTruthyFlag(std.mem.span(v))) return true;
+    }
+    if (std.posix.getenv("OPENCLAW_ALLOW_YOLO")) |v| {
+        if (isTruthyFlag(std.mem.span(v))) return true;
+    }
+    return false;
+}
+
+fn isLoopbackGatewayHost(host: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.eql(u8, host, "[::1]");
+}
+
+fn isYoloGatewayAllowed(level: yc.security.AutonomyLevel, host: []const u8, forced: bool) bool {
+    if (level != .yolo) return true;
+    if (forced) return true;
+    return isLoopbackGatewayHost(host);
+}
+
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn printGatewayUsage() void {
@@ -366,6 +396,14 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.debug.print("Invalid port in CLI args.\n", .{});
         std.process.exit(1);
     };
+
+    if (!isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, isYoloForceEnabled())) {
+        std.debug.print(
+            "Refusing to start gateway with autonomy.level=yolo on non-local host '{s}'. Use localhost or set NULLCLAW_ALLOW_YOLO=1 to force this insecure mode.\n",
+            .{cfg.gateway.host},
+        );
+        std.process.exit(1);
+    }
 
     // Check both sub_args and global args for --verbose flag
     var verbose = hasVerboseFlag(sub_args);
@@ -3903,6 +3941,22 @@ test "applyGatewayDaemonOverrides rejects invalid port" {
     };
     const args = [_][]const u8{ "--port", "bad" };
     try std.testing.expectError(error.InvalidPort, applyGatewayDaemonOverrides(&cfg, &args));
+}
+
+test "isYoloGatewayAllowed rejects remote host without force" {
+    try std.testing.expect(!isYoloGatewayAllowed(.yolo, "0.0.0.0", false));
+}
+
+test "isYoloGatewayAllowed allows localhost without force" {
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "127.0.0.1", false));
+}
+
+test "isYoloGatewayAllowed allows force override" {
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "0.0.0.0", true));
+}
+
+test "isYoloGatewayAllowed allows non-yolo levels" {
+    try std.testing.expect(isYoloGatewayAllowed(.supervised, "0.0.0.0", false));
 }
 
 test "hasConfiguredStartableChannels ignores cli and webhook-only defaults" {
