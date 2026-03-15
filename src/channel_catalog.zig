@@ -15,6 +15,7 @@ pub const ChannelId = enum {
     irc,
     lark,
     dingtalk,
+    wecom,
     signal,
     email,
     line,
@@ -54,6 +55,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .irc, .key = "irc", .label = "IRC", .configured_message = "IRC configured", .listener_mode = .gateway_loop },
     .{ .id = .lark, .key = "lark", .label = "Lark", .configured_message = "Lark configured", .listener_mode = .webhook_only },
     .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .send_only },
+    .{ .id = .wecom, .key = "wecom", .label = "WeCom", .configured_message = "WeCom configured", .listener_mode = .send_only },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
     .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .send_only },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
@@ -78,6 +80,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .irc => build_options.enable_channel_irc,
         .lark => build_options.enable_channel_lark,
         .dingtalk => build_options.enable_channel_dingtalk,
+        .wecom => build_options.enable_channel_wecom,
         .signal => build_options.enable_channel_signal,
         .email => build_options.enable_channel_email,
         .line => build_options.enable_channel_line,
@@ -102,6 +105,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "irc")) return build_options.enable_channel_irc;
     if (comptime std.mem.eql(u8, key, "lark")) return build_options.enable_channel_lark;
     if (comptime std.mem.eql(u8, key, "dingtalk")) return build_options.enable_channel_dingtalk;
+    if (comptime std.mem.eql(u8, key, "wecom")) return build_options.enable_channel_wecom;
     if (comptime std.mem.eql(u8, key, "signal")) return build_options.enable_channel_signal;
     if (comptime std.mem.eql(u8, key, "email")) return build_options.enable_channel_email;
     if (comptime std.mem.eql(u8, key, "line")) return build_options.enable_channel_line;
@@ -127,6 +131,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .irc => cfg.channels.irc.len,
         .lark => cfg.channels.lark.len,
         .dingtalk => cfg.channels.dingtalk.len,
+        .wecom => cfg.channels.wecom.len,
         .signal => cfg.channels.signal.len,
         .email => cfg.channels.email.len,
         .line => cfg.channels.line.len,

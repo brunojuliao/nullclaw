@@ -402,6 +402,18 @@ pub const DingTalkConfig = struct {
     allow_from: []const []const u8 = &.{},
 };
 
+pub const WeComConfig = struct {
+    account_id: []const u8 = "default",
+    webhook_url: []const u8,
+    /// Callback verification token (used to compute/verify msg_signature).
+    callback_token: ?[]const u8 = null,
+    /// WeCom EncodingAESKey (43 chars base64 without padding) used to decrypt callback payloads.
+    encoding_aes_key: ?[]const u8 = null,
+    /// Expected receiver ID (typically CorpID) for decrypted callback validation.
+    corp_id: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
 pub const SignalConfig = struct {
     account_id: []const u8 = "default",
     http_url: []const u8,
@@ -690,6 +702,7 @@ pub const ChannelsConfig = struct {
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
+    wecom: []const WeComConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
     line: []const LineConfig = &.{},
@@ -746,6 +759,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn dingtalkPrimary(self: *const ChannelsConfig) ?DingTalkConfig {
         return primaryAccount(DingTalkConfig, self.dingtalk);
+    }
+    pub fn wecomPrimary(self: *const ChannelsConfig) ?WeComConfig {
+        return primaryAccount(WeComConfig, self.wecom);
     }
     pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
         return primaryAccount(EmailConfig, self.email);

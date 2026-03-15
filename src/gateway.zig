@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /wecom, /qq, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -372,6 +372,11 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    wecom_account_id: []const u8 = "default",
+    wecom_allow_from: []const []const u8 = &.{},
+    wecom_callback_token: []const u8 = "",
+    wecom_encoding_aes_key: []const u8 = "",
+    wecom_corp_id: []const u8 = "",
     qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
@@ -965,6 +970,44 @@ fn selectLarkConfig(
     return &cfg.channels.lark[0];
 }
 
+fn findWeComConfigByAccountId(
+    cfg: *const Config,
+    account_id: []const u8,
+) ?*const config_types.WeComConfig {
+    for (cfg.channels.wecom) |*wecom_cfg| {
+        if (std.ascii.eqlIgnoreCase(wecom_cfg.account_id, account_id)) return wecom_cfg;
+    }
+    return null;
+}
+
+fn selectWeComConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+) ?*const config_types.WeComConfig {
+    if (!build_options.enable_channel_wecom) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.wecom.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findWeComConfigByAccountId(cfg, account_id)) |wecom_cfg| {
+            return wecom_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findWeComConfigByAccountId(cfg, account_id)) |wecom_cfg| {
+            return wecom_cfg;
+        }
+    }
+
+    if (cfg.channels.wecomPrimary()) |primary| {
+        if (findWeComConfigByAccountId(cfg, primary.account_id)) |wecom_cfg| {
+            return wecom_cfg;
+        }
+    }
+
+    return &cfg.channels.wecom[0];
+}
+
 fn findQqConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.QQConfig {
     for (cfg.channels.qq) |*qq_cfg| {
         if (std.ascii.eqlIgnoreCase(qq_cfg.account_id, account_id)) return qq_cfg;
@@ -1460,6 +1503,28 @@ fn larkSessionKeyRouted(
     );
 }
 
+fn wecomSessionKey(buf: []u8, sender: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "wecom:{s}", .{sender}) catch "wecom:unknown";
+}
+
+fn wecomSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    sender: []const u8,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = wecomSessionKey(fallback_buf, sender);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "wecom",
+        account_id,
+        .{ .kind = .direct, .id = sender },
+        fallback,
+    );
+}
+
 // ── Message Processing ──────────────────────────────────────────
 
 /// Extract the HTTP request body from raw bytes.
@@ -1682,6 +1747,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    .{ .path = "/wecom", .handler = handleWeComWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
 };
 
@@ -2415,6 +2481,192 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_wecom) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wecom channel disabled in this build\"}";
+        return;
+    }
+
+    var wecom_account_id = ctx.state.wecom_account_id;
+    var wecom_allow_from = ctx.state.wecom_allow_from;
+    var secure_token = ctx.state.wecom_callback_token;
+    var secure_aes_key = ctx.state.wecom_encoding_aes_key;
+    var secure_corp_id = ctx.state.wecom_corp_id;
+    var wecom_cfg_opt: ?*const config_types.WeComConfig = null;
+    if (selectWeComConfig(ctx.config_opt, ctx.target)) |wecom_cfg| {
+        wecom_cfg_opt = wecom_cfg;
+        wecom_account_id = wecom_cfg.account_id;
+        wecom_allow_from = wecom_cfg.allow_from;
+        secure_token = wecom_cfg.callback_token orelse "";
+        secure_aes_key = wecom_cfg.encoding_aes_key orelse "";
+        secure_corp_id = wecom_cfg.corp_id orelse "";
+    }
+
+    const secure_enabled = secure_token.len > 0 and secure_aes_key.len > 0;
+
+    if (std.mem.eql(u8, ctx.method, "GET")) {
+        if (parseQueryParam(ctx.target, "echostr")) |echo_str| {
+            if (secure_enabled) {
+                const msg_sig = parseQueryParam(ctx.target, "msg_signature") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+                    return;
+                };
+                const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                    return;
+                };
+                const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing nonce\"}";
+                    return;
+                };
+
+                if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, echo_str, msg_sig)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid signature\"}";
+                    return;
+                }
+
+                const expected_receive_id: ?[]const u8 = if (secure_corp_id.len > 0) secure_corp_id else null;
+                const plain_echo = channels.wecom.decryptSecurePayload(
+                    ctx.req_allocator,
+                    secure_aes_key,
+                    echo_str,
+                    expected_receive_id,
+                ) catch {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"decrypt failed\"}";
+                    return;
+                };
+                ctx.response_body = plain_echo;
+            } else {
+                ctx.response_body = echo_str;
+            }
+        } else {
+            ctx.response_body = "{\"status\":\"ok\"}";
+        }
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "wecom")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const inbound_payload = if (secure_enabled) blk: {
+        const encrypted = channels.wecom.extractEncryptedField(body) orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing Encrypt field\"}";
+            return;
+        };
+        const msg_sig = parseQueryParam(ctx.target, "msg_signature") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+            return;
+        };
+        const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing timestamp\"}";
+            return;
+        };
+        const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing nonce\"}";
+            return;
+        };
+
+        if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, encrypted, msg_sig)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            return;
+        }
+
+        const expected_receive_id: ?[]const u8 = if (secure_corp_id.len > 0) secure_corp_id else null;
+        break :blk channels.wecom.decryptSecurePayload(
+            ctx.req_allocator,
+            secure_aes_key,
+            encrypted,
+            expected_receive_id,
+        ) catch {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"decrypt failed\"}";
+            return;
+        };
+    } else ctx.req_allocator.dupe(u8, body) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    defer ctx.req_allocator.free(inbound_payload);
+
+    var inbound = channels.wecom.parseIncomingPayload(ctx.req_allocator, inbound_payload) catch {
+        ctx.response_body = "{\"status\":\"parse_error\"}";
+        return;
+    } orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    defer inbound.deinit(ctx.req_allocator);
+
+    if (wecom_allow_from.len > 0 and !channels.isAllowed(wecom_allow_from, inbound.sender)) {
+        ctx.response_body = "{\"status\":\"unauthorized\"}";
+        return;
+    }
+
+    var key_buf: [128]u8 = undefined;
+    const session_key = wecomSessionKeyRouted(
+        ctx.req_allocator,
+        &key_buf,
+        inbound.sender,
+        ctx.config_opt,
+        wecom_account_id,
+    );
+
+    if (ctx.state.event_bus) |eb| {
+        var meta_buf: [320]u8 = undefined;
+        const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"direct\",\"peer_id\":\"{s}\"}}", .{
+            wecom_account_id,
+            inbound.sender,
+        }) catch null;
+        _ = publishToBus(eb, ctx.state.allocator, "wecom", inbound.sender, inbound.sender, inbound.content, session_key, meta);
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    }
+
+    if (ctx.session_mgr_opt) |sm| {
+        const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch |err| blk: {
+            if (wecom_cfg_opt) |wecom_cfg| {
+                var wecom_ch = channels.wecom.WeComChannel.initFromConfig(ctx.req_allocator, wecom_cfg.*);
+                wecom_ch.sendMessageAuto("", userFacingAgentError(err)) catch {};
+            }
+            break :blk null;
+        };
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            if (wecom_cfg_opt) |wecom_cfg| {
+                var wecom_ch = channels.wecom.WeComChannel.initFromConfig(ctx.req_allocator, wecom_cfg.*);
+                wecom_ch.sendMessageAuto("", r) catch {};
+            }
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (!build_options.enable_channel_qq) {
         ctx.response_status = "404 Not Found";
@@ -2524,7 +2776,7 @@ fn applyRuntimeProviderOverrides(config: *const Config) !void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wecom, POST /qq
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -2598,6 +2850,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_app_secret = lark_cfg.app_secret;
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
+        }
+        if (cfg.channels.wecomPrimary()) |wecom_cfg| {
+            state.wecom_allow_from = wecom_cfg.allow_from;
+            state.wecom_account_id = wecom_cfg.account_id;
+            state.wecom_callback_token = wecom_cfg.callback_token orelse "";
+            state.wecom_encoding_aes_key = wecom_cfg.encoding_aes_key orelse "";
+            state.wecom_corp_id = wecom_cfg.corp_id orelse "";
         }
         if (build_options.enable_channel_qq) {
             for (cfg.channels.qq) |qq_cfg| {
@@ -2996,6 +3255,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/wecom") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
@@ -3503,6 +3763,35 @@ test "selectLarkConfig picks account by verification token" {
     const body = "{\"header\":{\"token\":\"token-b\"}}";
     const selected = selectLarkConfig(&cfg, body);
     if (!build_options.enable_channel_lark) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectWeComConfig picks account by query account_id" {
+    const wecom_accounts = [_]config_types.WeComConfig{
+        .{
+            .account_id = "main",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=main",
+        },
+        .{
+            .account_id = "backup",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .wecom = &wecom_accounts,
+        },
+    };
+
+    const selected = selectWeComConfig(&cfg, "/wecom?account_id=backup");
+    if (!build_options.enable_channel_wecom) {
         try std.testing.expect(selected == null);
         return;
     }
@@ -4028,6 +4317,32 @@ test "larkSessionKeyRouted uses route engine when config exists" {
 
     const key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
     try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", key);
+}
+
+test "wecomSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "wecom-dm-agent",
+                .match = .{
+                    .channel = "wecom",
+                    .account_id = "wecom-main",
+                    .peer = .{ .kind = .direct, .id = "zhangsan" },
+                },
+            },
+        },
+    };
+
+    const key = wecomSessionKeyRouted(allocator, &key_buf, "zhangsan", &cfg, "wecom-main");
+    try std.testing.expectEqualStrings("agent:wecom-dm-agent:wecom:direct:zhangsan", key);
 }
 
 // ── extractBody tests ────────────────────────────────────────────
