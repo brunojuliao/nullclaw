@@ -1692,8 +1692,8 @@ pub const Agent = struct {
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
-        var seen_tool_call_fingerprints: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer seen_tool_call_fingerprints.deinit(self.allocator);
+        var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
+        defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
@@ -2221,23 +2221,25 @@ pub const Agent = struct {
 
                 const tool_timer = std.time.milliTimestamp();
                 const result = blk: {
-                    if (shouldSkipDuplicateToolCallInTurn(self.allocator, &seen_tool_call_fingerprints, call)) {
+                    if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
                         break :blk ToolExecutionResult{
                             .name = call.name,
-                            .output = "Skipped duplicate tool_call in same turn",
-                            .success = true,
+                            .output = cached_result.output,
+                            .success = cached_result.success,
                             .tool_call_id = call.tool_call_id,
                         };
                     }
-                    if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call)) {
-                        break :blk ToolExecutionResult{
+                    const executed_result = if (should_skip_tools_memory_store_duplicate(arena, batch_updates_tools_md, call))
+                        ToolExecutionResult{
                             .name = call.name,
                             .output = "Skipped duplicate memory_store: TOOLS.md was updated in the same tool batch",
                             .success = true,
                             .tool_call_id = call.tool_call_id,
-                        };
-                    }
-                    break :blk self.executeTool(arena, call);
+                        }
+                    else
+                        self.executeTool(arena, call);
+                    rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
+                    break :blk executed_result;
                 };
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
@@ -2423,16 +2425,49 @@ pub const Agent = struct {
         return hasher.final();
     }
 
-    fn shouldSkipDuplicateToolCallInTurn(
-        allocator: std.mem.Allocator,
-        seen_tool_call_fingerprints: *std.AutoHashMapUnmanaged(u64, void),
-        call: ParsedToolCall,
-    ) bool {
-        const fingerprint = toolCallDedupFingerprint(call);
-        if (seen_tool_call_fingerprints.contains(fingerprint)) return true;
+    const CachedToolCallResult = struct {
+        success: bool,
+        output: []const u8,
+    };
 
-        seen_tool_call_fingerprints.put(allocator, fingerprint, {}) catch return false;
-        return false;
+    fn deinitSeenToolCallResults(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+    ) void {
+        var it = seen_tool_call_results.valueIterator();
+        while (it.next()) |cached_result| {
+            if (cached_result.output.len > 0) allocator.free(cached_result.output);
+        }
+        seen_tool_call_results.deinit(allocator);
+    }
+
+    fn cachedToolCallResultInTurn(
+        seen_tool_call_results: *const std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        call: ParsedToolCall,
+    ) ?CachedToolCallResult {
+        return seen_tool_call_results.get(toolCallDedupFingerprint(call));
+    }
+
+    fn rememberToolCallResultInTurn(
+        allocator: std.mem.Allocator,
+        seen_tool_call_results: *std.AutoHashMapUnmanaged(u64, CachedToolCallResult),
+        call: ParsedToolCall,
+        result: ToolExecutionResult,
+    ) void {
+        const fingerprint = toolCallDedupFingerprint(call);
+        if (seen_tool_call_results.contains(fingerprint)) return;
+
+        const output_copy = if (result.output.len == 0)
+            ""
+        else
+            allocator.dupe(u8, result.output) catch return;
+
+        seen_tool_call_results.put(allocator, fingerprint, .{
+            .success = result.success,
+            .output = output_copy,
+        }) catch {
+            if (output_copy.len > 0) allocator.free(output_copy);
+        };
     }
 
     fn is_tools_markdown_path(path: []const u8) bool {
@@ -6555,10 +6590,10 @@ test "toolCallDedupFingerprint prefers tool_call_id over arguments" {
     try std.testing.expectEqual(Agent.toolCallDedupFingerprint(call_a), Agent.toolCallDedupFingerprint(call_b));
 }
 
-test "shouldSkipDuplicateToolCallInTurn dedups repeated calls in same batch" {
+test "rememberToolCallResultInTurn reuses repeated calls in same batch" {
     const allocator = std.testing.allocator;
-    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer seen.deinit(allocator);
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
 
     const call_a = ParsedToolCall{
         .name = "memory_search",
@@ -6576,9 +6611,47 @@ test "shouldSkipDuplicateToolCallInTurn dedups repeated calls in same batch" {
         .tool_call_id = null,
     };
 
-    try std.testing.expect(!Agent.shouldSkipDuplicateToolCallInTurn(allocator, &seen, call_a));
-    try std.testing.expect(Agent.shouldSkipDuplicateToolCallInTurn(allocator, &seen, call_b));
-    try std.testing.expect(!Agent.shouldSkipDuplicateToolCallInTurn(allocator, &seen, call_c));
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_a) == null);
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, call_a, .{
+        .name = call_a.name,
+        .output = "first result",
+        .success = true,
+        .tool_call_id = null,
+    });
+
+    const cached_b = Agent.cachedToolCallResultInTurn(&seen, call_b).?;
+    try std.testing.expect(cached_b.success);
+    try std.testing.expectEqualStrings("first result", cached_b.output);
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, call_c) == null);
+}
+
+test "rememberToolCallResultInTurn preserves failed result for replayed tool_call_id" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const original_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl https://example.com\"}",
+        .tool_call_id = "call_retry_me",
+    };
+    const replayed_call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl https://example.com --retry 2\"}",
+        .tool_call_id = "call_retry_me",
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, original_call, .{
+        .name = original_call.name,
+        .output = "Rate limit exceeded",
+        .success = false,
+        .tool_call_id = original_call.tool_call_id,
+    });
+
+    const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call).?;
+    try std.testing.expect(!cached_replay.success);
+    try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
 }
 
 test "Agent turn skips replayed tool_call_id across iterations" {
