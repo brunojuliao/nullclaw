@@ -348,13 +348,16 @@ Discord example:
       "accounts": {
         "default": {
           "token": "YOUR_DISCORD_BOT_TOKEN",
-          "intents": 37377
+          "intents": 37377,
+          "allow_from": ["YOUR_DISCORD_USER_ID"]
         }
       }
     }
   }
 }
 ```
+
+Set `allow_from` explicitly unless you intentionally want an open bot. In the current Discord runtime, an omitted or empty `allow_from` list disables filtering instead of denying all inbound messages.
 
 Enable MESSAGE CONTENT INTENT in the Discord Developer Portal if you want the bot to process ordinary guild messages. Without it, Discord omits message content for most guild traffic; direct messages and messages that mention the bot still include content.
 
@@ -364,11 +367,11 @@ Discord setup flow:
 1. Create application at https://discord.com/developers/applications
 2. Bot section → Add Bot → Reset Token (copy immediately)
 3. Privileged Gateway Intents → Enable MESSAGE CONTENT INTENT → Save
-4. OAuth2 → URL Generator → Scopes: `bot`, `applications.commands`
+4. OAuth2 → URL Generator → Scopes: `bot`
 5. Bot Permissions: Send Messages, Read Message History, Read Messages/View Channels
 6. Copy URL, open in browser, select server, authorize
 
-Required permissions: Send Messages, Read Message History, Read Messages/View Channels. Optional: Add Reactions, Manage Messages, Embed Links, Attach Files, Use External Emojis, Mention Everyone, Administrator (use with caution).
+The current Discord integration does not require extra OAuth scopes or elevated permissions such as `Administrator`.
 
 Multi-bot setup uses `accounts` wrapper. Each `account_id` creates an independent Discord bot connection with separate session state and routing:
 
@@ -431,7 +434,7 @@ Parameters:
 - `token` (required) - Bot token from Discord Developer Portal
 - `intents` (default: 37377) - Gateway intents bitmask
 - `allow_bots` (default: false) - Allow messages from other bots
-- `allow_from` (default: []) - Optional allowlist of user IDs; empty disables filtering, `["*"]` matches all users
+- `allow_from` (default: []) - Optional allowlist of user IDs; for Discord, an omitted or empty list disables filtering, so set explicit IDs for a private bot. `["*"]` also matches all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
 - `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
 
@@ -442,6 +445,8 @@ Verification:
 nullclaw channel start discord
 nullclaw channel status
 ```
+
+`nullclaw channel start discord` starts only the first configured Discord account. For multi-account validation, run `nullclaw gateway` and send a test message to each configured bot.
 
 Common issues:
 - Bot only responds in DMs or explicit mentions: enable MESSAGE CONTENT INTENT, then re-invite the bot if needed
