@@ -279,6 +279,37 @@ Practical effect:
 - Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
 - `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
 
+### `reliability`
+
+- Configures global retry and failover behavior for LLM providers.
+- `provider_retries`: Number of times to retry a failed LLM request (default: 2).
+- `provider_backoff_ms`: Initial exponential backoff delay between retries (default: 500).
+- `fallback_providers`: List of provider names to try if the primary provider for a model fails.
+- `model_fallbacks`: Mapping of a model to an ordered list of fallback models. Used when the current model returns errors (e.g. ModelUnavailable, ContextExhausted).
+
+Example:
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- Failover order: For each model in the fallback chain, NullClaw tries the primary provider first, then each listed `fallback_provider`.
+- `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
+
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.
